@@ -7,7 +7,7 @@ nginx_tests="$(cd "${2:?nginx-tests checkout is required}" && pwd)"
 module_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$nginx_source"
-./auto/configure \
+./configure \
     --prefix="$nginx_source/test-prefix" \
     --with-debug \
     --with-http_ssl_module \
