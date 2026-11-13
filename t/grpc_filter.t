@@ -20,7 +20,7 @@ select STDOUT; $| = 1;
 
 my $t = Test::Nginx->new()->has(qw/http grpc rewrite
 	ngx_http_grpc_filter_module/)
-	->plan(14);
+	->plan(17);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 
@@ -33,6 +33,17 @@ events {
 
 http {
     %%TEST_GLOBALS_HTTP%%
+
+    upstream retry_backend {
+        server 127.0.0.1:8083 max_fails=0;
+        server 127.0.0.1:8081 backup;
+    }
+
+    server {
+        listen 127.0.0.1:8083;
+        http2 on;
+        return 502;
+    }
 
     server {
         listen       127.0.0.1:8081;
@@ -117,6 +128,14 @@ http {
             grpc_pass grpc://127.0.0.1:8081;
         }
 
+        location = /retry {
+            grpc_filter_test on;
+            grpc_filter_test_finalize on;
+            grpc_next_upstream http_502;
+            add_header X-Upstream-Attempts $upstream_status always;
+            grpc_pass grpc://retry_backend;
+        }
+
         location = /finalize {
             grpc_filter_test on;
             grpc_filter_test_finalize on;
@@ -167,9 +186,18 @@ is(body('/disabled'), 'GET|/disabled||||',
 is(body('/finalize'), 'GET|/finalize|127.0.0.1:8081|/finalize|1|1',
 	'finalized request still returns its upstream response');
 
+my $retry = response('/retry');
+like($retry, qr/^X-Upstream-Attempts: 502, 200\x0d?$/mi,
+	'gRPC retries the failed upstream');
+is(http_content($retry), 'GET|/retry|retry_backend|/retry|1|1',
+	'gRPC retry preserves the filtered request');
+
 my $log = $t->read_file('error.log');
 my @finalized = $log =~ /grpc filter test finalized: \/finalize /g;
 is(scalar @finalized, 1, 'finalize phase runs once per request');
+
+@finalized = $log =~ /grpc filter test finalized: \/retry /g;
+is(scalar @finalized, 1, 'gRPC retry finalizes once');
 
 ###############################################################################
 

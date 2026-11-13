@@ -1,0 +1,844 @@
+--- a/src/http/modules/ngx_http_grpc_module.c
++++ b/src/http/modules/ngx_http_grpc_module.c
+@@ -8,6 +8,10 @@
+ #include <ngx_config.h>
+ #include <ngx_core.h>
+ #include <ngx_http.h>
++
++#if (NGX_HTTP_GRPC_FILTER)
++#include <ngx_http_grpc_filter_module.h>
++#endif
+ 
+ 
+ typedef struct {
+@@ -127,6 +131,11 @@
+     ngx_http_request_t        *request;
+ 
+     ngx_str_t                  host;
++
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_str_t                  uri;
++    ngx_list_t                 headers_in;
++#endif
+ } ngx_http_grpc_ctx_t;
+ 
+ 
+@@ -145,6 +154,11 @@
+ 
+ static ngx_int_t ngx_http_grpc_eval(ngx_http_request_t *r,
+     ngx_http_grpc_ctx_t *ctx, ngx_http_grpc_loc_conf_t *glcf);
++#if (NGX_HTTP_GRPC_FILTER)
++static ngx_int_t ngx_http_grpc_build_uri(ngx_http_request_t *r,
++    ngx_http_grpc_ctx_t *ctx, ngx_http_grpc_loc_conf_t *glcf,
++    ngx_str_t *uri);
++#endif
+ static ngx_int_t ngx_http_grpc_create_request(ngx_http_request_t *r);
+ static ngx_int_t ngx_http_grpc_reinit_request(ngx_http_request_t *r);
+ static ngx_int_t ngx_http_grpc_body_output_filter(void *data, ngx_chain_t *in);
+@@ -621,6 +635,13 @@
+     u->input_filter = ngx_http_grpc_filter;
+     u->input_filter_ctx = ctx;
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++    rc = ngx_http_grpc_filter_access_hook(r);
++    if (rc != NGX_OK) {
++        return rc;
++    }
++#endif
++
+     r->request_body_no_buffering = 1;
+ 
+     rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
+@@ -730,6 +751,67 @@
+ }
+ 
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++
++static ngx_int_t
++ngx_http_grpc_build_uri(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
++    ngx_http_grpc_loc_conf_t *glcf, ngx_str_t *uri)
++{
++    u_char     *p;
++    size_t      len, loc_len;
++    uintptr_t   escape;
++
++    if (r->valid_unparsed_uri) {
++        *uri = r->unparsed_uri;
++        return NGX_OK;
++    }
++
++    loc_len = 0;
++
++    if (r->quoted_uri || r->internal) {
++        escape = 2 * ngx_escape_uri(NULL, r->uri.data + loc_len,
++                                    r->uri.len - loc_len, NGX_ESCAPE_URI);
++
++    } else {
++        escape = 0;
++    }
++
++    len = ctx->uri.len + r->uri.len - loc_len + escape
++          + sizeof("?") - 1 + r->args.len;
++
++    p = ngx_pnalloc(r->pool, len);
++    if (p == NULL) {
++        return NGX_ERROR;
++    }
++
++    uri->data = p;
++
++    if (r->valid_location) {
++        p = ngx_copy(p, ctx->uri.data, ctx->uri.len);
++    }
++
++    if (escape) {
++        ngx_escape_uri(p, r->uri.data + loc_len,
++                       r->uri.len - loc_len, NGX_ESCAPE_URI);
++        p += r->uri.len - loc_len + escape;
++
++    } else {
++        p = ngx_copy(p, r->uri.data + loc_len, r->uri.len - loc_len);
++    }
++
++    if (r->args.len > 0) {
++        *p++ = '?';
++        p = ngx_copy(p, r->args.data, r->args.len);
++    }
++
++    uri->len = p - uri->data;
++
++    return NGX_OK;
++}
++
++#endif
++
++
+ static ngx_int_t
+ ngx_http_grpc_create_request(ngx_http_request_t *r)
+ {
+@@ -737,13 +819,21 @@
+                                  *headers_end;
+     size_t                        len, headers_len, tmp_len,
+                                   key_len, val_len, uri_len;
++#if (NGX_HTTP_GRPC_FILTER)
++    size_t                        old_tmp_len;
++    size_t                        method_len, host_len;
++#else
+     uintptr_t                     escape;
++#endif
+     ngx_buf_t                    *b;
+     ngx_str_t                     host;
+     ngx_uint_t                    i, next;
+     ngx_chain_t                  *cl, *body;
+     ngx_list_part_t              *part;
+     ngx_table_elt_t              *header;
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_table_elt_t              *th;
++#endif
+     ngx_http_grpc_ctx_t          *ctx;
+     ngx_http_upstream_t          *u;
+     ngx_http_grpc_frame_t        *f;
+@@ -751,6 +841,9 @@
+     ngx_http_grpc_loc_conf_t     *glcf;
+     ngx_http_script_engine_t      e, le;
+     ngx_http_script_len_code_pt   lcode;
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_str_t                     method, uri;
++#endif
+ 
+     u = r->upstream;
+ 
+@@ -764,6 +857,38 @@
+     headers_len = 0;
+ 
+     /* :method header */
++
++#if (NGX_HTTP_GRPC_FILTER)
++    method = r->method_name;
++
++    if (method.len == 0 || method.data == NULL) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "invalid grpc method");
++        return NGX_ERROR;
++    }
++
++    if (method.len > NGX_HTTP_V2_MAX_FIELD) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "too long http2 method: \"%V\"", &method);
++        return NGX_ERROR;
++    }
++
++    if ((method.len == 3
++         && ngx_strncmp(method.data, "GET", 3) == 0)
++        || (method.len == 4
++            && ngx_strncmp(method.data, "POST", 4) == 0))
++    {
++        method_len = 1;
++        len += method_len;
++        tmp_len = 0;
++
++    } else {
++        method_len = 1 + NGX_HTTP_V2_INT_OCTETS + method.len;
++        len += method_len;
++        tmp_len = method.len;
++    }
++
++#else
+ 
+     if (r->method == NGX_HTTP_GET || r->method == NGX_HTTP_POST) {
+         len += 1;
+@@ -780,11 +905,35 @@
+         tmp_len = r->method_name.len;
+     }
+ 
++#endif
++
+     /* :scheme header */
+ 
+     len += 1;
+ 
+     /* :path header */
++
++#if (NGX_HTTP_GRPC_FILTER)
++
++    if (ngx_http_grpc_build_uri(r, ctx, glcf, &uri) != NGX_OK) {
++        return NGX_ERROR;
++    }
++
++    uri_len = uri.len;
++
++    if (uri_len > NGX_HTTP_V2_MAX_FIELD) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "too long http2 URI");
++        return NGX_ERROR;
++    }
++
++    len += 1 + NGX_HTTP_V2_INT_OCTETS + uri_len;
++
++    if (tmp_len < uri_len) {
++        tmp_len = uri_len;
++    }
++
++#else
+ 
+     if (r->valid_unparsed_uri) {
+         escape = 0;
+@@ -808,6 +957,8 @@
+         tmp_len = uri_len;
+     }
+ 
++#endif
++
+     /* :authority header */
+ 
+     host.len = 0;
+@@ -831,6 +982,10 @@
+         return NGX_ERROR;
+     }
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++    host_len = host.len;
++#endif
++
+     len += 1 + NGX_HTTP_V2_INT_OCTETS + host.len;
+ 
+     if (tmp_len < host.len) {
+@@ -883,6 +1038,117 @@
+             tmp_len = val_len;
+         }
+     }
++
++#if (NGX_HTTP_GRPC_FILTER)
++
++    if (ngx_list_init(&ctx->headers_in, r->pool, 16,
++                      sizeof(ngx_table_elt_t))
++        != NGX_OK)
++    {
++        return NGX_ERROR;
++    }
++
++    tmp = ngx_palloc(r->pool, tmp_len * 3);
++    if (tmp == NULL) {
++        return NGX_ERROR;
++    }
++
++    key_tmp = tmp + tmp_len;
++    val_tmp = tmp + 2 * tmp_len;
++    old_tmp_len = tmp_len;
++
++    ngx_memzero(&e, sizeof(ngx_http_script_engine_t));
++
++    e.ip = glcf->headers.values->elts;
++    e.request = r;
++    e.flushed = 1;
++
++    le.ip = glcf->headers.lengths->elts;
++    le.request = r;
++    le.flushed = 1;
++
++    while (*(uintptr_t *) le.ip) {
++
++        lcode = *(ngx_http_script_len_code_pt *) le.ip;
++        key_len = lcode(&le);
++
++        for (val_len = 0; *(uintptr_t *) le.ip; val_len += lcode(&le)) {
++            lcode = *(ngx_http_script_len_code_pt *) le.ip;
++        }
++
++        le.ip += sizeof(uintptr_t);
++
++        if (val_len == 0) {
++            e.skip = 1;
++
++            while (*(uintptr_t *) e.ip) {
++                code = *(ngx_http_script_code_pt *) e.ip;
++                code((ngx_http_script_engine_t *) &e);
++            }
++
++            e.ip += sizeof(uintptr_t);
++            e.skip = 0;
++
++            continue;
++        }
++
++        e.pos = key_tmp;
++        e.end = key_tmp + tmp_len;
++
++        code = *(ngx_http_script_code_pt *) e.ip;
++        code((ngx_http_script_engine_t *) &e);
++
++        if (e.status) {
++            return NGX_ERROR;
++        }
++
++        key_len = e.pos - key_tmp;
++
++        e.pos = val_tmp;
++        e.end = val_tmp + tmp_len;
++
++        while (*(uintptr_t *) e.ip) {
++            code = *(ngx_http_script_code_pt *) e.ip;
++            code((ngx_http_script_engine_t *) &e);
++        }
++
++        e.ip += sizeof(uintptr_t);
++
++        if (e.status) {
++            return NGX_ERROR;
++        }
++
++        val_len = e.pos - val_tmp;
++
++        th = ngx_list_push(&ctx->headers_in);
++        if (th == NULL) {
++            return NGX_ERROR;
++        }
++
++        th->key.len = key_len;
++        th->value.len = val_len;
++
++        th->key.data = ngx_pnalloc(r->pool,
++                                   key_len + 1 + val_len + 1 + key_len);
++        if (th->key.data == NULL) {
++            return NGX_ERROR;
++        }
++
++        th->value.data = th->key.data + key_len + 1;
++        th->lowcase_key = th->key.data + key_len + 1 + val_len + 1;
++
++        ngx_memcpy(th->key.data, key_tmp, key_len);
++        th->key.data[key_len] = '\0';
++        ngx_strlow(th->lowcase_key, th->key.data, th->key.len);
++
++        ngx_memcpy(th->value.data, val_tmp, val_len);
++        th->value.data[val_len] = '\0';
++
++        th->hash = ngx_hash_key_lc(th->key.data, th->key.len);
++        th->next = NULL;
++    }
++
++#endif
+ 
+     len += headers_len;
+ 
+@@ -922,6 +1188,22 @@
+                 return NGX_ERROR;
+             }
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++            th = ngx_list_push(&ctx->headers_in);
++            if (th == NULL) {
++                return NGX_ERROR;
++            }
++
++            th->key = header[i].key;
++            th->value = header[i].value;
++            th->hash = header[i].hash;
++            th->lowcase_key = header[i].lowcase_key;
++            th->next = NULL;
++
++            headers_len += 1 + NGX_HTTP_V2_INT_OCTETS + header[i].key.len
++                             + NGX_HTTP_V2_INT_OCTETS + header[i].value.len;
++#endif
++
+             len += 1 + NGX_HTTP_V2_INT_OCTETS + header[i].key.len
+                      + NGX_HTTP_V2_INT_OCTETS + header[i].value.len;
+ 
+@@ -934,6 +1216,146 @@
+             }
+         }
+     }
++
++#if (NGX_HTTP_GRPC_FILTER)
++
++    if (ngx_http_grpc_filter_request_hook(r, &ctx->headers_in, &method,
++                                          &host, &uri)
++        != NGX_OK)
++    {
++        return NGX_ERROR;
++    }
++
++    u->method = method;
++
++    if (method.len == 0 || method.data == NULL) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "invalid grpc method");
++        return NGX_ERROR;
++    }
++
++    if (method.len > NGX_HTTP_V2_MAX_FIELD) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "too long http2 method: \"%V\"", &method);
++        return NGX_ERROR;
++    }
++
++    len -= method_len;
++
++    if ((method.len == 3 && ngx_strncmp(method.data, "GET", 3) == 0)
++        || (method.len == 4 && ngx_strncmp(method.data, "POST", 4) == 0))
++    {
++        method_len = 1;
++
++    } else {
++        method_len = 1 + NGX_HTTP_V2_INT_OCTETS + method.len;
++
++        if (tmp_len < method.len) {
++            tmp_len = method.len;
++        }
++    }
++
++    len += method_len;
++
++    if (uri.len == 0 || uri.data == NULL) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "zero length URI to grpc");
++        return NGX_ERROR;
++    }
++
++    if (uri.len > NGX_HTTP_V2_MAX_FIELD) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "too long http2 URI");
++        return NGX_ERROR;
++    }
++
++    len = len - uri_len + uri.len;
++    uri_len = uri.len;
++
++    if (tmp_len < uri_len) {
++        tmp_len = uri_len;
++    }
++
++    if (host.len > NGX_HTTP_V2_MAX_FIELD) {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "too long http2 host: \"%V\"", &host);
++        return NGX_ERROR;
++    }
++
++    len = len - host_len + host.len;
++    host_len = host.len;
++
++    if (tmp_len < host_len) {
++        tmp_len = host_len;
++    }
++
++    len -= headers_len;
++    headers_len = 0;
++
++    part = &ctx->headers_in.part;
++    header = part->elts;
++
++    for (i = 0; /* void */; i++) {
++
++        if (i >= part->nelts) {
++            if (part->next == NULL) {
++                break;
++            }
++
++            part = part->next;
++            header = part->elts;
++            i = 0;
++        }
++
++        if (header[i].hash == 0) {
++            continue;
++        }
++
++        if (header[i].key.len > NGX_HTTP_V2_MAX_FIELD) {
++            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                          "too long http2 header name: \"%V\"",
++                          &header[i].key);
++            return NGX_ERROR;
++        }
++
++        if (header[i].value.len > NGX_HTTP_V2_MAX_FIELD) {
++            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                          "too long http2 header value: \"%V: %V\"",
++                          &header[i].key, &header[i].value);
++            return NGX_ERROR;
++        }
++
++        headers_len += 1 + NGX_HTTP_V2_INT_OCTETS + header[i].key.len
++                         + NGX_HTTP_V2_INT_OCTETS + header[i].value.len;
++
++        if (tmp_len < header[i].key.len) {
++            tmp_len = header[i].key.len;
++        }
++
++        if (tmp_len < header[i].value.len) {
++            tmp_len = header[i].value.len;
++        }
++    }
++
++    len += headers_len;
++
++#endif
++
++#if (NGX_HTTP_GRPC_FILTER)
++
++    ctx->host = host;
++
++    if (tmp_len > old_tmp_len) {
++        tmp = ngx_palloc(r->pool, tmp_len * 3);
++        if (tmp == NULL) {
++            return NGX_ERROR;
++        }
++    }
++
++    key_tmp = tmp + tmp_len;
++    val_tmp = tmp + 2 * tmp_len;
++
++#endif
+ 
+     /* continuation frames */
+ 
+@@ -954,6 +1376,8 @@
+     cl->buf = b;
+     cl->next = NULL;
+ 
++#if !(NGX_HTTP_GRPC_FILTER)
++
+     tmp = ngx_palloc(r->pool, tmp_len * 3);
+     if (tmp == NULL) {
+         return NGX_ERROR;
+@@ -961,6 +1385,7 @@
+ 
+     key_tmp = tmp + tmp_len;
+     val_tmp = tmp + 2 * tmp_len;
++#endif
+ 
+     /* connection preface */
+ 
+@@ -984,6 +1409,27 @@
+     f->stream_id_2 = 0;
+     f->stream_id_3 = 1;
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++
++    if (method.len == 3 && ngx_strncmp(method.data, "GET", 3) == 0) {
++        *b->last++ = ngx_http_v2_indexed(NGX_HTTP_V2_METHOD_GET_INDEX);
++
++    } else if (method.len == 4
++               && ngx_strncmp(method.data, "POST", 4) == 0)
++    {
++        *b->last++ = ngx_http_v2_indexed(NGX_HTTP_V2_METHOD_POST_INDEX);
++
++    } else {
++        *b->last++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_METHOD_INDEX);
++        b->last = ngx_http_v2_write_value(b->last, method.data,
++                                          method.len, tmp);
++    }
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "grpc header: \":method: %V\"", &method);
++
++#else
++
+     if (r->method == NGX_HTTP_GET) {
+         *b->last++ = ngx_http_v2_indexed(NGX_HTTP_V2_METHOD_GET_INDEX);
+ 
+@@ -1004,6 +1450,8 @@
+         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                        "grpc header: \":method: %V\"", &r->method_name);
+     }
++
++#endif
+ 
+ #if (NGX_HTTP_SSL)
+     if (u->ssl) {
+@@ -1020,6 +1468,23 @@
+                        "grpc header: \":scheme: http\"");
+     }
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++
++    if (uri.len == 1 && uri.data[0] == '/') {
++        *b->last++ = ngx_http_v2_indexed(NGX_HTTP_V2_PATH_ROOT_INDEX);
++
++    } else {
++        *b->last++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_PATH_INDEX);
++        b->last = ngx_http_v2_write_value(b->last, uri.data, uri.len, tmp);
++    }
++
++    u->uri = uri;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "grpc header: \":path: %V\"", &uri);
++
++#else
++
+     if (r->valid_unparsed_uri) {
+ 
+         if (r->unparsed_uri.len == 1 && r->unparsed_uri.data[0] == '/') {
+@@ -1065,11 +1530,66 @@
+                        "grpc header: \":path: %V\"", &r->uri);
+     }
+ 
++#endif
++
+     *b->last++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_AUTHORITY_INDEX);
+     b->last = ngx_http_v2_write_value(b->last, host.data, host.len, tmp);
+ 
+     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "grpc header: \":authority: %V\"", &host);
++
++#if (NGX_HTTP_GRPC_FILTER)
++
++    headers_end = b->last + headers_len;
++
++    part = &ctx->headers_in.part;
++    header = part->elts;
++
++    for (i = 0; /* void */; i++) {
++
++        if (i >= part->nelts) {
++            if (part->next == NULL) {
++                break;
++            }
++
++            part = part->next;
++            header = part->elts;
++            i = 0;
++        }
++
++        if (header[i].hash == 0) {
++            continue;
++        }
++
++        if (headers_end - b->last
++            < (ssize_t) (1 + NGX_HTTP_V2_INT_OCTETS + header[i].key.len
++                         + NGX_HTTP_V2_INT_OCTETS + header[i].value.len))
++        {
++            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
++                          "no buffer space in grpc create request");
++            return NGX_ERROR;
++        }
++
++        *b->last++ = 0;
++
++        b->last = ngx_http_v2_write_name(b->last, header[i].key.data,
++                                         header[i].key.len, key_tmp);
++
++        b->last = ngx_http_v2_write_value(b->last, header[i].value.data,
++                                          header[i].value.len, val_tmp);
++
++#if (NGX_DEBUG)
++        if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
++            ngx_strlow(key_tmp, header[i].key.data, header[i].key.len);
++
++            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                           "grpc header: \"%*s: %V\"",
++                           header[i].key.len, key_tmp, &header[i].value);
++        }
++#endif
++    }
++
++#else
+ 
+     ngx_memzero(&e, sizeof(ngx_http_script_engine_t));
+ 
+@@ -1212,6 +1732,8 @@
+ #endif
+         }
+     }
++
++#endif
+ 
+     /* update headers frame length */
+ 
+@@ -1719,6 +2241,10 @@
+     ngx_int_t                       rc, status;
+     ngx_buf_t                      *b;
+     ngx_table_elt_t                *h;
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_uint_t                      i;
++    ngx_list_part_t                *part;
++#endif
+     ngx_http_upstream_t            *u;
+     ngx_http_grpc_ctx_t            *ctx;
+     ngx_http_upstream_header_t     *hh;
+@@ -2025,6 +2551,8 @@
+                     continue;
+                 }
+ 
++#if !(NGX_HTTP_GRPC_FILTER)
++
+                 hh = ngx_hash_find(&umcf->headers_in_hash, h->hash,
+                                    h->lowcase_key, h->key.len);
+ 
+@@ -2035,6 +2563,7 @@
+                         return rc;
+                     }
+                 }
++#endif
+ 
+                 continue;
+             }
+@@ -2056,6 +2585,46 @@
+                     ctx->status = 0;
+                     return NGX_HTTP_UPSTREAM_EARLY_HINTS;
+                 }
++
++#if (NGX_HTTP_GRPC_FILTER)
++                rc = ngx_http_grpc_filter_header_hook(r);
++                if (rc != NGX_OK) {
++                    return rc;
++                }
++
++                part = &u->headers_in.headers.part;
++                h = part->elts;
++
++                for (i = 0; /* void */; i++) {
++
++                    if (i >= part->nelts) {
++                        if (part->next == NULL) {
++                            break;
++                        }
++
++                        part = part->next;
++                        h = part->elts;
++                        i = 0;
++                    }
++
++                    if (h[i].hash == 0) {
++                        continue;
++                    }
++
++                    h[i].next = NULL;
++
++                    hh = ngx_hash_find(&umcf->headers_in_hash, h[i].hash,
++                                       h[i].lowcase_key, h[i].key.len);
++
++                    if (hh) {
++                        rc = hh->handler(r, &h[i], hh->offset);
++
++                        if (rc != NGX_OK) {
++                            return rc;
++                        }
++                    }
++                }
++#endif
+ 
+                 if (ctx->end_stream) {
+ 
+@@ -2145,6 +2714,9 @@
+     ngx_int_t             rc;
+     ngx_buf_t            *b, *buf;
+     ngx_chain_t          *cl, **ll;
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_chain_t         **filter;
++#endif
+     ngx_table_elt_t      *h;
+     ngx_http_request_t   *r;
+     ngx_http_upstream_t  *u;
+@@ -2577,6 +3149,10 @@
+             return NGX_AGAIN;
+         }
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++        filter = ll;
++#endif
++
+         cl = ngx_chain_get_free_buf(r->pool, &u->free_bufs);
+         if (cl == NULL) {
+             return NGX_ERROR;
+@@ -2614,6 +3190,12 @@
+                 ctx->length -= buf->last - buf->pos;
+             }
+ 
++#if (NGX_HTTP_GRPC_FILTER)
++            if (ngx_http_grpc_filter_body_hook(r, filter) != NGX_OK) {
++                return NGX_ERROR;
++            }
++#endif
++
+             return NGX_AGAIN;
+         }
+ 
+@@ -2632,6 +3214,14 @@
+ 
+             ctx->length -= buf->last - buf->pos;
+         }
++
++#if (NGX_HTTP_GRPC_FILTER)
++        if (ngx_http_grpc_filter_body_hook(r, filter) != NGX_OK) {
++            return NGX_ERROR;
++        }
++
++        ngx_http_grpc_filter_update_chain_last(&u->out_bufs, &ll);
++#endif
+ 
+     done:
+ 
+@@ -4440,6 +5030,7 @@
+     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                    "grpc cleanup");
+ #endif
++
+     return;
+ }
+ 
+@@ -4458,6 +5049,11 @@
+ {
+     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "finalize grpc request");
++
++#if (NGX_HTTP_GRPC_FILTER)
++    ngx_http_grpc_filter_finalize_hook(r, rc);
++#endif
++
+     return;
+ }
+ 
+--- a/src/http/ngx_http.h
++++ b/src/http/ngx_http.h
+@@ -11,6 +11,9 @@
+ 
+ #include <ngx_config.h>
+ #include <ngx_core.h>
++
++
++#define NGX_HTTP_GRPC_FILTER_CORE  1
+ 
+ 
+ typedef struct ngx_http_request_s     ngx_http_request_t;

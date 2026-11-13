@@ -13,8 +13,8 @@
 #include <ngx_http.h>
 
 
-#if !defined(NGX_RESTY_EXT) || !(NGX_RESTY_EXT)
-#error "ngx_http_grpc_filter_module requires NGX_RESTY_EXT"
+#if !(NGX_HTTP_GRPC_FILTER_CORE)
+#error "ngx_http_grpc_filter_module requires its nginx core patch"
 #endif
 
 
